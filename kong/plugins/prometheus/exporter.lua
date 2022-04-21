@@ -16,12 +16,13 @@ local stream_available, stream_api = pcall(require, "kong.tools.stream_api")
 
 local role = kong.configuration.role
 
-local DEFAULT_BUCKETS = { 1, 2, 5, 7, 10, 15, 20, 25, 30, 40, 50, 60, 70,
-                          80, 90, 100, 200, 300, 400, 500, 1000,
-                          2000, 5000, 10000, 30000, 60000 }
+local KONG_LATENCY_BUCKETS = { 1, 2, 5, 7, 10, 15, 20, 30, 50, 75, 100, 200, 500, 750, 1000}
+local UPSTREAM_LATENCY_BUCKETS = {25, 50, 80, 100, 250, 400, 700, 1000, 2000, 5000, 10000, 30000, 60000 }
+
 local metrics = {}
 -- prometheus.lua instance
 local prometheus
+local node_id = kong.node.get_id()
 
 -- use the same counter library shipped with Kong
 package.loaded['prometheus_resty_counter'] = require("resty.counter")
@@ -39,21 +40,18 @@ local function init()
   prometheus = require("kong.plugins.prometheus.prometheus").init(shm, "kong_")
 
   -- global metrics
-  if kong_subsystem == "http" then
-    metrics.connections = prometheus:gauge("nginx_http_current_connections",
-      "Number of HTTP connections",
-      {"state"})
-  else
-    metrics.connections = prometheus:gauge("nginx_stream_current_connections",
-      "Number of Stream connections",
-      {"state"})
-  end
+  metrics.connections = prometheus:gauge("nginx_current_connections",
+    "Number of connections by subsystem",
+    {"node_id", "subsystem", "state"})
   metrics.timers = prometheus:gauge("nginx_timers",
                                     "Number of nginx timers",
                                     {"state"})
   metrics.db_reachable = prometheus:gauge("datastore_reachable",
                                           "Datastore reachable from Kong, " ..
                                           "0 is unreachable")
+  metrics.node_info = prometheus:gauge("node_info",
+                                       "Kong Node metadata information",
+                                       {"node_id", "version"})
   -- only export upstream health metrics in traditional mode and data plane
   if role ~= "control_plane" then
     metrics.upstream_target_health = prometheus:gauge("upstream_target_health",
@@ -66,44 +64,50 @@ local function init()
   local memory_stats = {}
   memory_stats.worker_vms = prometheus:gauge("memory_workers_lua_vms_bytes",
                                              "Allocated bytes in worker Lua VM",
-                                             {"pid", "kong_subsystem"})
+                                             {"node_id", "pid", "kong_subsystem"})
   memory_stats.shms = prometheus:gauge("memory_lua_shared_dict_bytes",
                                        "Allocated slabs in bytes in a shared_dict",
-                                       {"shared_dict", "kong_subsystem"})
+                                       {"node_id", "shared_dict", "kong_subsystem"})
   memory_stats.shm_capacity = prometheus:gauge("memory_lua_shared_dict_total_bytes",
                                                "Total capacity in bytes of a shared_dict",
-                                               {"shared_dict", "kong_subsystem"})
+                                               {"node_id", "shared_dict", "kong_subsystem"})
 
   local res = kong.node.get_memory_stats()
   for shm_name, value in pairs(res.lua_shared_dicts) do
-    memory_stats.shm_capacity:set(value.capacity, { shm_name, kong_subsystem })
+    memory_stats.shm_capacity:set(value.capacity, { node_id, shm_name, kong_subsystem })
   end
 
   metrics.memory_stats = memory_stats
 
   -- per service/route
   if kong_subsystem == "http" then
-    metrics.status = prometheus:counter("http_status",
-                                        "HTTP status codes per service/route in Kong",
-                                        {"service", "route", "code"})
+    metrics.status = prometheus:counter("request_count",
+                                        "HTTP status codes per consumer/service/route in Kong",
+                                        {"service", "route", "code", "source", "consumer"})
   else
     metrics.status = prometheus:counter("stream_status",
-                                        "Stream status codes per service/route in Kong",
-                                        {"service", "route", "code"})
+                                        "Stream status codes per consumer/service/route in Kong",
+                                        {"service", "route", "code", "source", "consumer"})
   end
-  metrics.latency = prometheus:histogram("latency",
-                                         "Latency added by Kong, total " ..
-                                         "request time and upstream latency " ..
-                                         "for each service/route in Kong",
-                                         {"service", "route", "type"},
-                                         DEFAULT_BUCKETS) -- TODO make this configurable
+  metrics.kong_latency = prometheus:histogram("kong_latency",
+                                              "Latency added by Kong and enabled plugins " ..
+                                              "for each service/route in Kong",
+                                              {"service", "route"},
+                                              KONG_LATENCY_BUCKETS)
+  metrics.upstream_latency = prometheus:histogram("upstream_latency",
+                                                  "Latency added by upstream response " ..
+                                                  "for each service/route in Kong",
+                                                  {"service", "route"},
+                                                  UPSTREAM_LATENCY_BUCKETS)
+  metrics.total_latency = prometheus:histogram("total_request_latency",
+                                               "Total latency incurred during requests " ..
+                                               "for each service/route in Kong",
+                                               {"service", "route"},
+                                               UPSTREAM_LATENCY_BUCKETS)
   metrics.bandwidth = prometheus:counter("bandwidth",
-                                         "Total bandwidth in bytes " ..
-                                         "consumed per service/route in Kong",
-                                         {"service", "route", "type"})
-  metrics.consumer_status = prometheus:counter("http_consumer_status",
-                                          "HTTP status codes for customer per service/route in Kong",
-                                          {"service", "route", "code", "consumer"})
+                                         "Total bandwidth (ingress/egress) " ..
+                                         "throughput in bytes",
+                                         {"service", "route", "direction", "consumer"})
 
   -- Hybrid mode status
   if role == "control_plane" then
@@ -146,8 +150,9 @@ end
 
 -- Since in the prometheus library we create a new table for each diverged label
 -- so putting the "more dynamic" label at the end will save us some memory
-local labels_table = {0, 0, 0}
-local labels_table4 = {0, 0, 0, 0}
+local labels_table = {0, 0, 0, 0}
+local labels_table_status = {0, 0, 0, 0, 0}
+local latency_labels_table = {0, 0}
 local upstream_target_addr_health_table = {
   { value = 0, labels = { 0, 0, 0, "healthchecks_off", ngx.config.subsystem } },
   { value = 0, labels = { 0, 0, 0, "healthy", ngx.config.subsystem } },
@@ -190,10 +195,33 @@ if kong_subsystem == "http" then
       route_name = message.route.name or message.route.id
     end
 
+    local consumer = ""
+    if message and serialized.consumer ~= nil then
+      consumer = serialized.consumer
+    end
+
     labels_table[1] = service_name
     labels_table[2] = route_name
     labels_table[3] = message.response.status
-    metrics.status:inc(1, labels_table)
+    labels_table[4] = consumer
+
+    labels_table_status[1] = service_name
+    labels_table_status[2] = route_name
+    labels_table_status[3] = message.response.status
+    labels_table_status[5] = consumer
+
+    latency_labels_table[1] = service_name
+    latency_labels_table[2] = route_name
+
+    -- If number of upstream requests is greater than 0, assume upstream is the status code originator
+    -- Else, assume kong is the originator.
+    if(#(message.tries) > 0) then
+      labels_table_status[4] = "upstream"
+    else
+      labels_table_status[4] = "kong"
+    end
+
+    metrics.status:inc(1, labels_table_status)
 
     local request_size = tonumber(message.request.size)
     if request_size and request_size > 0 then
@@ -209,33 +237,22 @@ if kong_subsystem == "http" then
 
     local request_latency = message.latencies.request
     if request_latency and request_latency >= 0 then
-      labels_table[3] = "request"
-      metrics.latency:observe(request_latency, labels_table)
+      metrics.total_latency:observe(request_latency, latency_labels_table)
     end
 
     local upstream_latency = message.latencies.proxy
     if upstream_latency ~= nil and upstream_latency >= 0 then
-      labels_table[3] = "upstream"
-      metrics.latency:observe(upstream_latency, labels_table)
+      metrics.upstream_latency:observe(upstream_latency, latency_labels_table)
     end
 
     local kong_proxy_latency = message.latencies.kong
     if kong_proxy_latency ~= nil and kong_proxy_latency >= 0 then
-      labels_table[3] = "kong"
-      metrics.latency:observe(kong_proxy_latency, labels_table)
+      metrics.kong_latency:observe(kong_proxy_latency, latency_labels_table)
     end
 
-    if serialized.consumer ~= nil then
-      labels_table4[1] = labels_table[1]
-      labels_table4[2] = labels_table[2]
-      labels_table4[3] = message.response.status
-      labels_table4[4] = serialized.consumer
-      metrics.consumer_status:inc(1, labels_table4)
-    end
   end
-
 else
-  function log(message)
+  function log(message, serialized)
     if not metrics then
       kong.log.err("prometheus: can not log metrics because of an initialization "
               .. "error, please make sure that you've declared "
@@ -256,10 +273,34 @@ else
       route_name = message.route.name or message.route.id
     end
 
+    local consumer = ""
+    if message and serialized.consumer ~= nil then
+      consumer = serialized.consumer
+    end
+
+
     labels_table[1] = service_name
     labels_table[2] = route_name
     labels_table[3] = message.session.status
-    metrics.status:inc(1, labels_table)
+    labels_table[4] = consumer
+
+    latency_labels_table[1] = service_name
+    latency_labels_table[2] = route_name
+
+    labels_table_status[1] = service_name
+    labels_table_status[2] = route_name
+    labels_table_status[3] = message.session.status
+    labels_table_status[5] = consumer
+
+    -- If number of upstream requests is greater than 0, assume upstream is the status code originator
+    -- Else, assume kong is the originator.
+    if(#(message.tries) > 0) then
+      labels_table_status[4] = "upstream"
+    else
+      labels_table_status[4] = "kong"
+    end
+
+    metrics.status:inc(1, labels_table_status)
 
     local ingress_size = tonumber(message.session.received)
     if ingress_size and ingress_size > 0 then
@@ -275,14 +316,12 @@ else
 
     local session_latency = message.latencies.session
     if session_latency and session_latency >= 0 then
-      labels_table[3] = "request"
-      metrics.latency:observe(session_latency, labels_table)
+      metrics.total_latency:observe(session_latency, latency_labels_table)
     end
 
     local kong_proxy_latency = message.latencies.kong
     if kong_proxy_latency ~= nil and kong_proxy_latency >= 0 then
-      labels_table[3] = "kong"
-      metrics.latency:observe(kong_proxy_latency, labels_table)
+      metrics.kong_latency:observe(kong_proxy_latency, latency_labels_table)
     end
   end
 end
@@ -296,13 +335,13 @@ local function metric_data()
   end
 
   local nginx_statistics = kong.nginx.get_statistics()
-  metrics.connections:set(nginx_statistics['connections_accepted'], { "accepted" })
-  metrics.connections:set(nginx_statistics['connections_handled'], { "handled" })
-  metrics.connections:set(nginx_statistics['total_requests'], { "total" })
-  metrics.connections:set(nginx_statistics['connections_active'], { "active" })
-  metrics.connections:set(nginx_statistics['connections_reading'], { "reading" })
-  metrics.connections:set(nginx_statistics['connections_writing'], { "writing" })
-  metrics.connections:set(nginx_statistics['connections_waiting'], { "waiting" })
+  metrics.connections:set(nginx_statistics['connections_accepted'], { node_id, kong_subsystem, "accepted" })
+  metrics.connections:set(nginx_statistics['connections_handled'], { node_id, kong_subsystem, "handled" })
+  metrics.connections:set(nginx_statistics['total_requests'], { node_id, kong_subsystem, "total" })
+  metrics.connections:set(nginx_statistics['connections_active'], { node_id, kong_subsystem, "active" })
+  metrics.connections:set(nginx_statistics['connections_reading'], { node_id, kong_subsystem, "reading" })
+  metrics.connections:set(nginx_statistics['connections_writing'], { node_id, kong_subsystem, "writing" })
+  metrics.connections:set(nginx_statistics['connections_waiting'], { node_id, kong_subsystem,"waiting" })
 
   metrics.timers:set(ngx_timer_running_count(), {"running"})
   metrics.timers:set(ngx_timer_pending_count(), {"pending"})
@@ -357,11 +396,11 @@ local function metric_data()
   -- memory stats
   local res = kong.node.get_memory_stats()
   for shm_name, value in pairs(res.lua_shared_dicts) do
-    metrics.memory_stats.shms:set(value.allocated_slabs, { shm_name, kong_subsystem })
+    metrics.memory_stats.shms:set(value.allocated_slabs, { node_id, shm_name, kong_subsystem })
   end
   for i = 1, #res.workers_lua_vms do
     metrics.memory_stats.worker_vms:set(res.workers_lua_vms[i].http_allocated_gc,
-                                        { res.workers_lua_vms[i].pid, kong_subsystem })
+                                        { node_id, res.workers_lua_vms[i].pid, kong_subsystem })
   end
 
   -- Hybrid mode status
