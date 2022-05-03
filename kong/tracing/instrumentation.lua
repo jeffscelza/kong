@@ -175,12 +175,55 @@ function instrumentations.http_request()
   set_headers(header_type, root_span)
 end
 
+-- balancer
+function instrumentations.balancer(ctx)
+  local balancer_data = ctx.balancer_data
+  if not balancer_data then
+    return
+  end
+
+  local span
+  local balancer_tries = balancer_data.tries
+  local try_count = balancer_data.try_count
+  for i = 1, try_count do
+    local try = balancer_tries[i]
+    span = instrument_tracer.start_span("balancer try #" .. i, {
+      kind = 3, -- client
+      start_time_ns = try.balancer_start * 100000000,
+      attributes = {
+        ["kong.balancer.state"] = try.state,
+        ["http.status_code"] = try.code,
+        ["net.peer.ip"] = try.ip,
+        ["net.peer.port"] = try.port,
+      }
+    })
+
+    if i < try_count then
+      span:set_status(2)
+    end
+
+    if try.balancer_latency ~= nil then
+      span:finish((try.balancer_start + try.balancer_latency) * 100000000)
+    else
+      span:finish()
+    end
+  end
+end
+
+-- balancer
+function instrumentations.plugin_rewrite()
+  
+end
+
 for k, _ in pairs(instrumentations) do
   available_types[k] = true
 end
 instrumentations.available_types = available_types
 
 function instrumentations.runloop_log_before(ctx)
+  -- add balancer
+  instrumentations.balancer(ctx)
+
   local root_span = ngx.ctx.ROOT_SPAN
   -- check root span type to avoid encounter error
   if root_span and type(root_span.finish) == "function" then
