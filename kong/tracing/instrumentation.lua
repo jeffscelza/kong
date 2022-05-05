@@ -1,12 +1,7 @@
 local table       = table
 local pack        = table.pack
 local unpack      = table.unpack
-local fmt         = string.format
-local base        = require "resty.core.base"
-local to_hex      = require "resty.string".to_hex
 local pdk_tracer  = require "kong.pdk.tracing".new()
--- TODO(mayo): Bring the propagation library into PDK and make it possible to register custom handlers
-local propagation = require "kong.plugins.zipkin.tracing_headers"
 local time_ns     = require "kong.tools.utils".time_ns
 local tablepool   = require "tablepool"
 local tablex      = require "pl.tablex"
@@ -14,34 +9,13 @@ local tablex      = require "pl.tablex"
 local instrument_tracer = pdk_tracer
 local NOOP = function() end
 
-
-local function start_root_span()
-  if not base.get_request() then
-    return
-  end
-
-  local root_span = ngx.ctx.ROOT_SPAN
-  if root_span then
-    return
-  end
-
-  local start_time = ngx.ctx.KONG_PROCESSING_START
-      and ngx.ctx.KONG_PROCESSING_START * 100000
-      or time_ns()
-
-  -- we will later modify the span name, span_id
-  root_span = instrument_tracer.start_span("kong request", {
-    start_time_ns = start_time,
-  })
-  ngx.ctx.ROOT_SPAN = root_span
-  instrument_tracer.set_active_span(root_span)
-end
+local noop_tracer = pdk_tracer.new("instrumentation_noop", { noop = true })
+local NOOP_SPAN = noop_tracer.start_span()
 
 local wrap_func
 do
   local wrap_mt = {
     __call = function(self, ...)
-      start_root_span()
       local span = instrument_tracer.start_span(self.name)
       local ret = pack(self.f(...))
       span:finish()
@@ -61,60 +35,11 @@ end
 local instrumentations = {}
 local available_types = {}
 
-local function set_headers(found_header_type, proxy_span)
-  local set_header = kong.service.request.set_header
-  found_header_type = found_header_type or "ot"
-
-  if found_header_type == "b3" then
-    set_header("x-b3-traceid", to_hex(proxy_span.trace_id))
-    set_header("x-b3-spanid", to_hex(proxy_span.span_id))
-    if proxy_span.parent_id then
-      set_header("x-b3-parentspanid", to_hex(proxy_span.parent_id))
-    end
-    local Flags = kong.request.get_header("x-b3-flags") -- Get from request headers
-    if Flags then
-      set_header("x-b3-flags", Flags)
-    else
-      set_header("x-b3-sampled", proxy_span.sampled and "1" or "0")
-    end
-  end
-
-  if found_header_type == "b3-single" then
-    set_header("b3", fmt("%s-%s-%s-%s",
-      to_hex(proxy_span.trace_id),
-      to_hex(proxy_span.span_id),
-      proxy_span.sampled and "1" or "0",
-      to_hex(proxy_span.parent_id)))
-  end
-
-  if found_header_type == "w3c" then
-    set_header("traceparent", fmt("00-%s-%s-%s",
-      to_hex(proxy_span.trace_id),
-      to_hex(proxy_span.span_id),
-      proxy_span.sampled and "01" or "00"))
-  end
-
-  if found_header_type == "jaeger" then
-    set_header("uber-trace-id", fmt("%s:%s:%s:%s",
-      to_hex(proxy_span.trace_id),
-      to_hex(proxy_span.span_id),
-      to_hex(proxy_span.parent_id),
-      proxy_span.sampled and "01" or "00"))
-  end
-
-  if found_header_type == "ot" then
-    set_header("ot-tracer-traceid", to_hex(proxy_span.trace_id))
-    set_header("ot-tracer-spanid", to_hex(proxy_span.span_id))
-    set_header("ot-tracer-sampled", proxy_span.sampled and "1" or "0")
-  end
-end
-
 -- db query
 function instrumentations.db_query(connector)
   local f = connector.query
 
   local function wrap(self, sql, ...)
-    start_root_span()
     local span = instrument_tracer.start_span("query", {
       attributes = {
         sql = sql,
@@ -135,44 +60,26 @@ function instrumentations.router(router)
 end
 
 -- http_request (root span)
+-- we won't set the propagation headers there to avoid conflict with other tracing plugins
 function instrumentations.http_request()
   local req = kong.request
 
-  local headers = req.get_headers()
-  local header_type, trace_id, span_id, parent_id, sampled, _ = propagation.parse(headers)
   local method = req.get_method()
   local path = req.get_path()
   local span_name = method .. " " .. path
 
-  -- TODO(mayo): add host, port...
-  local root_span = ngx.ctx.ROOT_SPAN
-  if not root_span then
-    root_span = instrument_tracer.start_span(span_name, {
-      trace_id = trace_id,
-      span_id = span_id,
-      parent_id = parent_id,
-      sampled = sampled,
-    })
-    ngx.ctx.ROOT_SPAN = root_span
-    instrument_tracer.set_active_span(root_span)
-  else
-    root_span.name = span_name
-    if trace_id then
-      root_span.trace_id = trace_id
-    end
+  local start_time = ngx.ctx.KONG_PROCESSING_START
+      and ngx.ctx.KONG_PROCESSING_START * 100000
+      or time_ns()
 
-    if parent_id then
-      root_span.parent_id = parent_id
-    end
-
-    if sampled ~= nil then
-      root_span.sampled = sampled
-    end
-  end
-
-  root_span:set_attribute("http.host", req.get_host())
-
-  set_headers(header_type, root_span)
+  -- TODO(mayo): add more attributes
+  local active_span = instrument_tracer.start_span(span_name, {
+    start_time_ns = start_time,
+    attributes = {
+      ["http.host"] = req.get_host(),
+    },
+  })
+  instrument_tracer.set_active_span(active_span)
 end
 
 -- balancer
@@ -210,9 +117,19 @@ function instrumentations.balancer(ctx)
   end
 end
 
--- balancer
-function instrumentations.plugin_rewrite()
-  
+
+-- plugins
+do
+  local name_cache = {}
+  local function plugin_execute(phase, plugin_name, options)
+    local span_name = name_cache[phase .. plugin_name]
+    
+    local span = instrument_tracer.start_span("plugin " .. plugin_name .. phase, )
+  end
+end
+-- plugin_rewrite
+function instrumentations.plugin_rewrite(plugin_name, options)
+
 end
 
 for k, _ in pairs(instrumentations) do
@@ -220,14 +137,29 @@ for k, _ in pairs(instrumentations) do
 end
 instrumentations.available_types = available_types
 
+
+-- return noop span if the instrument not enabled
+function instrumentations.plugin_execute(phase, plugin_name, options)
+  local span
+  if phase == "rewrite" then
+    span = instrumentations.plugin_rewrite(plugin_name, options)
+  elseif phase == "access" then
+    span = instrumentations.plugin_rewrite(plugin_name, options)
+  elseif phase == "header_filter"then
+    span = instrumentations.plugin_rewrite(plugin_name, options)
+  end
+
+  return span or NOOP_SPAN
+end
+
 function instrumentations.runloop_log_before(ctx)
   -- add balancer
   instrumentations.balancer(ctx)
 
-  local root_span = ngx.ctx.ROOT_SPAN
+  local active_span = instrument_tracer.active_span()
   -- check root span type to avoid encounter error
-  if root_span and type(root_span.finish) == "function" then
-    root_span:finish()
+  if active_span and type(active_span.finish) == "function" then
+    active_span:finish()
   end
 end
 

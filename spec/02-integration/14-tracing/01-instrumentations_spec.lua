@@ -95,13 +95,13 @@ for _, strategy in helpers.each_strategy() do
 
         -- Making sure it's alright
         local spans = cjson.decode(res)
-        local expetecd_span_num = 2
+        local expetecd_span_num = 1
         -- cassandra has different db query implementation
         if strategy == "cassandra" then
-          expetecd_span_num = 4
+          expetecd_span_num = 3
         end
         assert.is_same(expetecd_span_num, #spans, res)
-        assert.is_same("query", spans[2].name)
+        assert.is_same("query", spans[1].name)
       end)
     end)
 
@@ -129,8 +129,8 @@ for _, strategy in helpers.each_strategy() do
 
         -- Making sure it's alright
         local spans = cjson.decode(res)
-        assert.is_same(2, #spans, res)
-        assert.is_same("router", spans[2].name)
+        assert.is_same(1, #spans, res)
+        assert.is_same("router", spans[1].name)
       end)
     end)
 
@@ -163,6 +163,35 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("balancer", function ()
+      lazy_setup(function()
+        setup_instrumentations("balancer")
+      end)
+
+      lazy_teardown(function()
+        helpers.stop_kong()
+      end)
+
+      it("works", function ()
+        local thread = helpers.tcp_server(TCP_PORT)
+        local r = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/",
+        })
+        assert.res_status(200, r)
+
+        -- Getting back the TCP server input
+        local ok, res = thread:join()
+        assert.True(ok)
+        assert.is_string(res)
+
+        -- Making sure it's alright
+        local spans = cjson.decode(res)
+        assert.is_same(1, #spans, res)
+        assert.is_same("balancer try #1", spans[1].name)
+      end)
+    end)
+
     describe("all", function ()
       lazy_setup(function()
         setup_instrumentations("all", true)
@@ -187,10 +216,10 @@ for _, strategy in helpers.each_strategy() do
 
         -- Making sure it's alright
         local spans = cjson.decode(res)
-        local expetecd_span_num = 5
+        local expetecd_span_num = 6
         -- cassandra has different db query implementation
         if strategy == "cassandra" then
-          expetecd_span_num = 7
+          expetecd_span_num = 8
         end
         assert.is_same(expetecd_span_num, #spans, res)
       end)
