@@ -11,6 +11,7 @@ local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
 local workspaces   = require "kong.workspaces"
 local lrucache     = require "resty.lrucache"
+local hooks        = require "kong.hooks"
 
 
 local PluginsIterator = require "kong.runloop.plugins_iterator"
@@ -41,6 +42,7 @@ local clear_header = ngx.req.clear_header
 local http_version = ngx.req.http_version
 local unpack       = unpack
 local escape       = require("kong.tools.uri").escape
+local run_hook     = hooks.run_hook
 
 
 local is_http_module   = subsystem == "http"
@@ -809,7 +811,6 @@ do
       return nil, "could not create router: " .. err
     end
 
-    instrumentation.router(new_router)
     router = new_router
 
     if version then
@@ -1275,8 +1276,10 @@ return {
       ctx.request_uri = var.request_uri
 
       -- routing request
+      local hook_res = run_hook("runloop:access:router:pre", ctx)
       local router = get_updated_router()
       local match_t = router.exec(ctx)
+      run_hook("runloop:access:router:post", hook_res, match_t)
       if not match_t then
         return kong.response.exit(404, { message = "no Route matched with those values" })
       end

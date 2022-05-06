@@ -1,36 +1,15 @@
-local table       = table
-local pack        = table.pack
-local unpack      = table.unpack
-local pdk_tracer  = require "kong.pdk.tracing".new()
-local time_ns     = require "kong.tools.utils".time_ns
-local tablepool   = require "tablepool"
-local tablex      = require "pl.tablex"
+local pdk_tracer = require "kong.pdk.tracing".new()
+local time_ns    = require "kong.tools.utils".time_ns
+local tablepool  = require "tablepool"
+local tablex     = require "pl.tablex"
+local hooks      = require "kong.hooks"
+
+local table         = table
+local pack          = table.pack
+local unpack        = table.unpack
 
 local instrument_tracer = pdk_tracer
 local NOOP = function() end
-
-local noop_tracer = pdk_tracer.new("instrumentation_noop", { noop = true })
-local NOOP_SPAN = noop_tracer.start_span()
-
-local wrap_func
-do
-  local wrap_mt = {
-    __call = function(self, ...)
-      local span = instrument_tracer.start_span(self.name)
-      local ret = pack(self.f(...))
-      span:finish()
-      return unpack(ret)
-    end
-  }
-
-  function wrap_func(name, f)
-    return setmetatable({
-      name = name, -- span name
-      f = f, -- callback
-    }, wrap_mt)
-  end
-end
-
 
 local instrumentations = {}
 local available_types = {}
@@ -54,9 +33,18 @@ function instrumentations.db_query(connector)
 end
 
 -- router
-function instrumentations.router(router)
-  local f = router.exec
-  router.exec = wrap_func("router", f)
+function instrumentations.router()
+  hooks.register_hook("runloop:access:router:pre", function (ctx)
+    return instrument_tracer.start_span("router")
+  end)
+
+  hooks.register_hook("runloop:access:router:post", function (span, match_t)
+    if not span then
+      return
+    end
+
+    span:finish()
+  end)
 end
 
 -- http_request (root span)
@@ -118,39 +106,32 @@ function instrumentations.balancer(ctx)
 end
 
 
--- plugins
-do
-  local name_cache = {}
-  local function plugin_execute(phase, plugin_name, options)
-    local span_name = name_cache[phase .. plugin_name]
-    
-    local span = instrument_tracer.start_span("plugin " .. plugin_name .. phase, )
+local function register_plugin_hook(phase)
+  return function ()
+    hooks.register_hook("plugin:" .. phase .. ":before", function (plugin)
+      return instrument_tracer.start_span(phase .. " phase: " .. plugin.name)
+    end)
+  
+    hooks.register_hook("plugin:" .. phase .. ":after", function (span)
+      if not span then
+        return
+      end
+  
+      span:finish()
+    end)
   end
 end
--- plugin_rewrite
-function instrumentations.plugin_rewrite(plugin_name, options)
 
-end
+instrumentations.plugin_rewrite = register_plugin_hook("rewrite")
+instrumentations.plugin_access = register_plugin_hook("access")
+instrumentations.plugin_header_filter = register_plugin_hook("header_filter")
+-- TODO(mayo): support body_filter
 
 for k, _ in pairs(instrumentations) do
   available_types[k] = true
 end
 instrumentations.available_types = available_types
 
-
--- return noop span if the instrument not enabled
-function instrumentations.plugin_execute(phase, plugin_name, options)
-  local span
-  if phase == "rewrite" then
-    span = instrumentations.plugin_rewrite(plugin_name, options)
-  elseif phase == "access" then
-    span = instrumentations.plugin_rewrite(plugin_name, options)
-  elseif phase == "header_filter"then
-    span = instrumentations.plugin_rewrite(plugin_name, options)
-  end
-
-  return span or NOOP_SPAN
-end
 
 function instrumentations.runloop_log_before(ctx)
   -- add balancer
@@ -199,12 +180,18 @@ function instrumentations.init(config)
     end
   end
 
-  -- global tracer
   if enabled then
+    -- global tracer
     instrument_tracer = pdk_tracer.new("instrument", {
       sampling_rate = sampling_rate,
     })
     instrument_tracer.set_global_tracer(instrument_tracer)
+
+    -- register hooks
+    instrumentations.router()
+    instrumentations.plugin_rewrite()
+    instrumentations.plugin_access()
+    instrumentations.plugin_header_filter()
   end
 end
 
