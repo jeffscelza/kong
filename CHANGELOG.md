@@ -128,6 +128,15 @@
 
 ### Additions
 
+#### Core
+
+- Introduced the tracing API which compatible with OpenTelemetry API spec and
+ add build-in instrumentations.  
+ The tracing API is intend to be used with a external exporter plugin.  
+ Build-in instrumentation types and sampling rate are configuable through
+ `opentelemetry_tracing` and `opentelemetry_tracing_sampling_rate` options.
+ [#8724](https://github.com/Kong/kong/pull/8724)
+
 #### Plugins
 
 - **Zipkin**: add support for including HTTP path in span name
