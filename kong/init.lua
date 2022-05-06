@@ -270,10 +270,15 @@ local function execute_access_plugins_iterator(plugins_iterator, ctx)
 
   for plugin, configuration in plugins_iterator:iterate("access", ctx) do
     if not ctx.delayed_response then
+      local span = run_hook("plugin:access:pre", plugin)
+
       setup_plugin_context(ctx, plugin)
 
       local co = coroutine.create(plugin.handler.access)
       local cok, cerr = coroutine.resume(co, plugin.handler, configuration)
+
+      run_hook("plugin:access:post", span, cok, cerr)
+
       if not cok then
         kong.log.err(cerr)
         ctx.delayed_response = {

@@ -108,11 +108,11 @@ end
 
 local function register_plugin_hook(phase)
   return function ()
-    hooks.register_hook("plugin:" .. phase .. ":before", function (plugin)
+    hooks.register_hook("plugin:" .. phase .. ":pre", function (plugin)
       return instrument_tracer.start_span(phase .. " phase: " .. plugin.name)
     end)
   
-    hooks.register_hook("plugin:" .. phase .. ":after", function (span)
+    hooks.register_hook("plugin:" .. phase .. ":post", function (span)
       if not span then
         return
       end
