@@ -43,6 +43,12 @@ local function init()
   metrics.connections = prometheus:gauge("nginx_current_connections",
     "Number of connections by subsystem",
     {"node_id", "subsystem", "state"})
+  metrics.nginx_requests_total = prometheus:counter("nginx_requests_total",
+      "Number of requests total", {"node_id", "subsystem"})
+  metrics.nginx_requests_accepted = prometheus:counter("nginx_requests_accepted",
+      "Number of requests accepted", {"node_id", "subsystem"})
+  metrics.nginx_requests_handled = prometheus:counter("nginx_requests_handled",
+      "Number of requests handled", {"node_id", "subsystem"})
   metrics.timers = prometheus:gauge("nginx_timers",
                                     "Number of nginx timers",
                                     {"state"})
@@ -335,13 +341,14 @@ local function metric_data()
   end
 
   local nginx_statistics = kong.nginx.get_statistics()
-  metrics.connections:set(nginx_statistics['connections_accepted'], { node_id, kong_subsystem, "accepted" })
-  metrics.connections:set(nginx_statistics['connections_handled'], { node_id, kong_subsystem, "handled" })
-  metrics.connections:set(nginx_statistics['total_requests'], { node_id, kong_subsystem, "total" })
   metrics.connections:set(nginx_statistics['connections_active'], { node_id, kong_subsystem, "active" })
   metrics.connections:set(nginx_statistics['connections_reading'], { node_id, kong_subsystem, "reading" })
   metrics.connections:set(nginx_statistics['connections_writing'], { node_id, kong_subsystem, "writing" })
   metrics.connections:set(nginx_statistics['connections_waiting'], { node_id, kong_subsystem,"waiting" })
+
+  metrics.nginx_requests_accepted:inc(1, { node_id, kong_subsystem })
+  metrics.nginx_requests_handled:inc(1, { node_id, kong_subsystem })
+  metrics.nginx_requests_total:inc(1, { node_id, kong_subsystem })
 
   metrics.timers:set(ngx_timer_running_count(), {"running"})
   metrics.timers:set(ngx_timer_pending_count(), {"pending"})
