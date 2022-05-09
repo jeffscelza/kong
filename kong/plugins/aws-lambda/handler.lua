@@ -7,6 +7,7 @@ local cjson = require "cjson.safe"
 local meta = require "kong.meta"
 local constants = require "kong.constants"
 local request_util = require "kong.plugins.aws-lambda.request-util"
+local kong_meta = require "kong.meta"
 
 
 local VIA_HEADER = constants.HEADERS.VIA
@@ -321,6 +322,6 @@ function AWSLambdaHandler:access(conf)
 end
 
 AWSLambdaHandler.PRIORITY = 750
-AWSLambdaHandler.VERSION = "3.6.3"
+AWSLambdaHandler.VERSION = kong_meta._VERSION
 
 return AWSLambdaHandler
